@@ -90,7 +90,6 @@ class _PhotoPickerSheetState extends State<PhotoPickerSheet> {
 
   @override
   Widget build(BuildContext context) {
-
     return ListenableBuilder(
       listenable: _controller,
       builder: (context, _) {
@@ -218,10 +217,9 @@ class _PickerBody extends StatelessWidget {
                 }
 
                 final item = items[index - 3];
-                final selectionIndex = controller.selectionIndexFor(item.id);
                 return _MediaGridTile(
+                  controller: controller,
                   item: item,
-                  selectionIndex: selectionIndex,
                   onTap: () => controller.toggleSelection(item),
                 );
               }, childCount: items.length + 3),
@@ -385,13 +383,13 @@ class _CameraBackdrop extends StatelessWidget {
 
 class _MediaGridTile extends StatelessWidget {
   const _MediaGridTile({
+    required this.controller,
     required this.item,
-    required this.selectionIndex,
     required this.onTap,
   });
 
+  final PhotoPickerController controller;
   final MediaGridItem item;
-  final int? selectionIndex;
   final VoidCallback onTap;
 
   @override
@@ -400,21 +398,28 @@ class _MediaGridTile extends StatelessWidget {
       onTap: onTap,
       child: ClipRRect(
         borderRadius: BorderRadius.circular(26),
-        child: Stack(
-          fit: StackFit.expand,
-          children: [
-            DecoratedBox(
-              decoration: const BoxDecoration(color: Color(0xFFE3E3E3)),
-              child: item.isImage
-                  ? _MediaPreview(item: item)
-                  : _FilePreview(item: item),
-            ),
-            Positioned(
-              top: 12,
-              right: 12,
-              child: _SelectionBadge(selectionIndex: selectionIndex),
-            ),
-          ],
+        child: RepaintBoundary(
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              DecoratedBox(
+                decoration: const BoxDecoration(color: Color(0xFFE3E3E3)),
+                child: item.isImage
+                    ? _MediaPreview(controller: controller, item: item)
+                    : _FilePreview(item: item),
+              ),
+              Positioned(
+                top: 12,
+                right: 12,
+                child: ValueListenableBuilder<int>(
+                  valueListenable: controller.selectionVersion,
+                  builder: (context, value, child) => _SelectionBadge(
+                    selectionIndex: controller.selectionIndexFor(item.id),
+                  ),
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -422,14 +427,17 @@ class _MediaGridTile extends StatelessWidget {
 }
 
 class _MediaPreview extends StatelessWidget {
-  const _MediaPreview({required this.item});
+  const _MediaPreview({required this.controller, required this.item});
 
+  final PhotoPickerController controller;
   final MediaGridItem item;
 
   @override
   Widget build(BuildContext context) {
     if (item.asset != null) {
-      return _AssetPreview(asset: item.asset!);
+      return _AssetPreview(
+        thumbnailFuture: controller.thumbnailFutureFor(item.asset!),
+      );
     }
 
     return Image.file(
@@ -447,14 +455,14 @@ class _MediaPreview extends StatelessWidget {
 }
 
 class _AssetPreview extends StatelessWidget {
-  const _AssetPreview({required this.asset});
+  const _AssetPreview({required this.thumbnailFuture});
 
-  final AssetEntity asset;
+  final Future<Uint8List?> thumbnailFuture;
 
   @override
   Widget build(BuildContext context) {
     return FutureBuilder<Uint8List?>(
-      future: asset.thumbnailDataWithSize(const ThumbnailSize(700, 700)),
+      future: thumbnailFuture,
       builder: (context, snapshot) {
         if (snapshot.hasData && snapshot.data != null) {
           return Image.memory(snapshot.data!, fit: BoxFit.cover);
@@ -587,6 +595,10 @@ class MediaGridItem {
 class PhotoPickerController extends ChangeNotifier {
   final ImagePicker _imagePicker = ImagePicker();
   final LinkedHashMap<String, MediaGridItem> _selectedItems = LinkedHashMap();
+  final ValueNotifier<int> selectionVersion = ValueNotifier<int>(0);
+  final Map<String, int> _selectedOrder = <String, int>{};
+  final Map<String, Future<Uint8List?>> _thumbnailFutures =
+      <String, Future<Uint8List?>>{};
 
   List<AssetEntity> _devicePhotos = const [];
   List<MediaGridItem> _importedItems = const [];
@@ -600,6 +612,13 @@ class PhotoPickerController extends ChangeNotifier {
     ..._importedItems,
     ..._devicePhotos.map(MediaGridItem.asset),
   ];
+
+  Future<Uint8List?> thumbnailFutureFor(AssetEntity asset) {
+    return _thumbnailFutures.putIfAbsent(
+      asset.id,
+      () => asset.thumbnailDataWithSize(const ThumbnailSize(700, 700)),
+    );
+  }
 
   Future<void> initialize() async {
     _isLoading = true;
@@ -675,18 +694,11 @@ class PhotoPickerController extends ChangeNotifier {
     } else {
       _selectedItems[item.id] = item;
     }
-    notifyListeners();
+    _updateSelectedOrder();
   }
 
   int? selectionIndexFor(String id) {
-    var index = 1;
-    for (final key in _selectedItems.keys) {
-      if (key == id) {
-        return index;
-      }
-      index++;
-    }
-    return null;
+    return _selectedOrder[id];
   }
 
   Future<void> _loadDevicePhotos() async {
@@ -701,6 +713,7 @@ class PhotoPickerController extends ChangeNotifier {
     }
 
     _devicePhotos = await albums.first.getAssetListPaged(page: 0, size: 150);
+    _syncThumbnailCache();
   }
 
   void _prependImportedFile(String path) {
@@ -712,7 +725,14 @@ class PhotoPickerController extends ChangeNotifier {
     updatedItems.insert(0, item);
     _importedItems = updatedItems;
     _selectedItems[item.id] = item;
+    _updateSelectedOrder();
     notifyListeners();
+  }
+
+  @override
+  void dispose() {
+    selectionVersion.dispose();
+    super.dispose();
   }
 
   bool _isImagePath(String path) {
@@ -731,5 +751,23 @@ class PhotoPickerController extends ChangeNotifier {
         ? path.split('.').last.toLowerCase()
         : '';
     return imageExtensions.contains(extension);
+  }
+
+  void _updateSelectedOrder() {
+    _selectedOrder
+      ..clear()
+      ..addEntries(
+        _selectedItems.keys
+            .toList(growable: false)
+            .asMap()
+            .entries
+            .map((entry) => MapEntry(entry.value, entry.key + 1)),
+      );
+    selectionVersion.value = selectionVersion.value + 1;
+  }
+
+  void _syncThumbnailCache() {
+    final visibleIds = _devicePhotos.map((asset) => asset.id).toSet();
+    _thumbnailFutures.removeWhere((id, _) => !visibleIds.contains(id));
   }
 }
